@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "NewPMDriver.h"
+#include "llvm/ADT/Any.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
@@ -24,6 +25,8 @@
 #include "llvm/CodeGen/LibcallLoweringInfo.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -44,8 +47,19 @@
 #include "llvm/Transforms/Utils/AssignGUID.h"
 #include "llvm/Transforms/Utils/Debugify.h"
 #include "llvm/Transforms/Utils/ProfileVerify.h"
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 using namespace llvm;
+
+static cl::opt<bool> PrintPassSummary(
+    "print-pass-summary",
+    cl::desc("Print a one-line summary (instruction/BB counts and per-opcode "
+             "changes) for each pass that changed the IR"),
+    cl::init(false));
 using namespace opt_tool;
 
 cl::opt<bool> llvm::DebugifyEach(
@@ -376,6 +390,110 @@ static void registerEPCallbacks(PassBuilder &PB) {
         });
 }
 
+namespace {
+struct IRStats {
+  std::string Name;
+  unsigned BBs = 0;
+  unsigned Insts = 0;
+  std::map<unsigned, unsigned> Ops; // opcode -> count
+};
+
+// Collect stats for a Function or Module. Other IR units (SCC, Loop) are
+// not handled.
+std::optional<IRStats> measureIR(Any IR) {
+  IRStats S;
+  auto CountFn = [&S](const Function &F) {
+    if (F.isDeclaration())
+      return;
+    for (const BasicBlock &BB : F) {
+      ++S.BBs;
+      for (const Instruction &I : BB) {
+        ++S.Insts;
+        ++S.Ops[I.getOpcode()];
+      }
+    }
+  };
+  if (const auto *M = llvm::any_cast<const Module *>(&IR)) {
+    S.Name = "[module]";
+    for (const Function &F : **M)
+      CountFn(F);
+  } else if (const auto *F = llvm::any_cast<const Function *>(&IR)) {
+    S.Name = (*F)->getName().str();
+    CountFn(**F);
+  } else {
+    return std::nullopt;
+  }
+  return S;
+}
+
+// Skip pass managers and adaptors; they only wrap other passes.
+bool isContainerPass(StringRef P) {
+  return P.contains("PassManager") || P.contains("Adaptor") ||
+         P.contains("AnalysisManagerProxy");
+}
+
+// Describe per-opcode changes, e.g. "mul -1, shl +1". Empty if unchanged.
+std::string describeOpcodeDiff(const IRStats &B, const IRStats &A) {
+  std::map<unsigned, int> Delta;
+  for (const auto &KV : B.Ops)
+    Delta[KV.first] -= static_cast<int>(KV.second);
+  for (const auto &KV : A.Ops)
+    Delta[KV.first] += static_cast<int>(KV.second);
+  std::string Out;
+  raw_string_ostream OS(Out);
+  bool First = true;
+  for (const auto &KV : Delta) {
+    if (KV.second == 0)
+      continue;
+    if (!First)
+      OS << ", ";
+    First = false;
+    OS << Instruction::getOpcodeName(KV.first) << " "
+       << (KV.second > 0 ? "+" : "") << KV.second;
+  }
+  return OS.str();
+}
+} // namespace
+
+static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
+  // Passes are nested, so keep the pre-pass stats on a stack.
+  auto Stack = std::make_shared<std::vector<std::optional<IRStats>>>();
+
+  PIC.registerBeforeNonSkippedPassCallback([Stack](StringRef P, Any IR) {
+    if (isContainerPass(P))
+      return;
+    Stack->push_back(measureIR(IR));
+  });
+
+  PIC.registerAfterPassCallback(
+      [Stack](StringRef P, Any IR, const PreservedAnalyses &) {
+        if (isContainerPass(P) || Stack->empty())
+          return;
+        std::optional<IRStats> Before = std::move(Stack->back());
+        Stack->pop_back();
+        std::optional<IRStats> After = measureIR(IR);
+        if (!Before || !After)
+          return;
+        std::string Diff = describeOpcodeDiff(*Before, *After);
+        if (Diff.empty() && Before->BBs == After->BBs)
+          return; // No change in instructions or basic blocks.
+        errs() << "[pass-summary] " << P << " on " << After->Name << ": insts "
+               << Before->Insts << " -> " << After->Insts << ", BBs "
+               << Before->BBs << " -> " << After->BBs;
+        if (!Diff.empty())
+          errs() << " | " << Diff;
+        errs() << "\n";
+      });
+
+  // If the IR is invalidated, the after-pass callback is not run, so pop
+  // the stack here to keep it in sync.
+  PIC.registerAfterPassInvalidatedCallback(
+      [Stack](StringRef P, const PreservedAnalyses &) {
+        if (!isContainerPass(P) && !Stack->empty())
+          Stack->pop_back();
+      });
+}
+
 bool llvm::runPassPipeline(
     StringRef Arg0, Module &M, TargetMachine *TM, TargetLibraryInfoImpl *TLII,
     ToolOutputFile *Out, ToolOutputFile *ThinLTOLinkOut,
@@ -458,6 +576,8 @@ bool llvm::runPassPipeline(
   StandardInstrumentations SI(M.getContext(), DebugPM != DebugLogging::None,
                               VK == VerifierKind::EachPass, PrintPassOpts);
   SI.registerCallbacks(PIC, &MAM);
+  if (PrintPassSummary)
+    registerPassSummary(PIC);
   DebugifyEachInstrumentation Debugify;
   DebugifyStatsMap DIStatsMap;
   DebugInfoPerPass DebugInfoBeforePass;
