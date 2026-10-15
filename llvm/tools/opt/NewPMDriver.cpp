@@ -22,6 +22,8 @@
 #include "llvm/Analysis/RuntimeLibcallInfo.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Bitcode/BitcodeWriterPass.h"
+#include "llvm/Analysis/LazyCallGraph.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/CodeGen/LibcallLoweringInfo.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/Dominators.h"
@@ -396,23 +398,28 @@ struct IRStats {
   unsigned BBs = 0;
   unsigned Insts = 0;
   std::map<unsigned, unsigned> Ops; // opcode -> count
+  // For loops: the parent function, which outlives a deleted loop.
+  const Function *Parent = nullptr;
 };
 
-// Collect stats for a Function or Module. Other IR units (SCC, Loop) are
+// Collect stats for a Module, Function, Loop or CGSCC. Other IR units are
 // not handled.
 std::optional<IRStats> measureIR(Any IR) {
   IRStats S;
-  auto CountFn = [&S](const Function &F) {
-    if (F.isDeclaration())
-      return;
-    for (const BasicBlock &BB : F) {
-      ++S.BBs;
-      for (const Instruction &I : BB) {
-        ++S.Insts;
-        ++S.Ops[I.getOpcode()];
-      }
+  auto CountBlock = [&S](const BasicBlock &BB) {
+    ++S.BBs;
+    for (const Instruction &I : BB) {
+      ++S.Insts;
+      ++S.Ops[I.getOpcode()];
     }
   };
+  auto CountFn = [&CountBlock](const Function &F) {
+    if (F.isDeclaration())
+      return;
+    for (const BasicBlock &BB : F)
+      CountBlock(BB);
+  };
+
   if (const auto *M = llvm::any_cast<const Module *>(&IR)) {
     S.Name = "[module]";
     for (const Function &F : **M)
@@ -420,6 +427,27 @@ std::optional<IRStats> measureIR(Any IR) {
   } else if (const auto *F = llvm::any_cast<const Function *>(&IR)) {
     S.Name = (*F)->getName().str();
     CountFn(**F);
+  } else if (const auto *L = llvm::any_cast<const Loop *>(&IR)) {
+    const BasicBlock *H = (*L)->getHeader();
+    S.Name = "loop %" +
+             (H->hasName() ? H->getName().str() : std::string("<unnamed>")) +
+             " in " + H->getParent()->getName().str();
+    // A loop pass may also change the preheader, exit blocks or guard
+    // blocks outside the loop, so measure the whole parent function.
+    S.Parent = H->getParent();
+    CountFn(*S.Parent);
+  } else if (const auto *C =
+                 llvm::any_cast<const LazyCallGraph::SCC *>(&IR)) {
+    S.Name = "(";
+    bool First = true;
+    for (const LazyCallGraph::Node &N : **C) {
+      if (!First)
+        S.Name += ", ";
+      First = false;
+      S.Name += N.getFunction().getName().str();
+      CountFn(N.getFunction());
+    }
+    S.Name += ")";
   } else {
     return std::nullopt;
   }
@@ -429,7 +457,8 @@ std::optional<IRStats> measureIR(Any IR) {
 // Skip pass managers and adaptors; they only wrap other passes.
 bool isContainerPass(StringRef P) {
   return P.contains("PassManager") || P.contains("Adaptor") ||
-         P.contains("AnalysisManagerProxy");
+         P.contains("AnalysisManagerProxy") || P.contains("RepeatedPass") ||
+         P.contains("InlinerWrapper");
 }
 
 // Describe per-opcode changes, e.g. "mul -1, shl +1". Empty if unchanged.
@@ -455,6 +484,19 @@ std::string describeOpcodeDiff(const IRStats &B, const IRStats &A) {
 }
 } // namespace
 
+static void printPassSummary(StringRef P, const IRStats &Before,
+                             const IRStats &After) {
+  std::string Diff = describeOpcodeDiff(Before, After);
+  if (Diff.empty() && Before.BBs == After.BBs)
+    return; // No change in instructions or basic blocks.
+  errs() << "[pass-summary] " << P << " on " << After.Name << ": insts "
+         << Before.Insts << " -> " << After.Insts << ", BBs " << Before.BBs
+         << " -> " << After.BBs;
+  if (!Diff.empty())
+    errs() << " | " << Diff;
+  errs() << "\n";
+}
+
 static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
   // Passes are nested, so keep the pre-pass stats on a stack.
   auto Stack = std::make_shared<std::vector<std::optional<IRStats>>>();
@@ -474,23 +516,25 @@ static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
         std::optional<IRStats> After = measureIR(IR);
         if (!Before || !After)
           return;
-        std::string Diff = describeOpcodeDiff(*Before, *After);
-        if (Diff.empty() && Before->BBs == After->BBs)
-          return; // No change in instructions or basic blocks.
-        errs() << "[pass-summary] " << P << " on " << After->Name << ": insts "
-               << Before->Insts << " -> " << After->Insts << ", BBs "
-               << Before->BBs << " -> " << After->BBs;
-        if (!Diff.empty())
-          errs() << " | " << Diff;
-        errs() << "\n";
+        printPassSummary(P, *Before, *After);
       });
 
-  // If the IR is invalidated, the after-pass callback is not run, so pop
-  // the stack here to keep it in sync.
+  // If the IR is invalidated (e.g. a deleted loop), the after-pass callback
+  // is not run. Pop the stack to keep it in sync, and for loops re-measure
+  // the parent function, which still exists. Other units are not recorded.
   PIC.registerAfterPassInvalidatedCallback(
       [Stack](StringRef P, const PreservedAnalyses &) {
-        if (!isContainerPass(P) && !Stack->empty())
-          Stack->pop_back();
+        if (isContainerPass(P) || Stack->empty())
+          return;
+        std::optional<IRStats> Before = std::move(Stack->back());
+        Stack->pop_back();
+        if (!Before || !Before->Parent)
+          return;
+        std::optional<IRStats> After = measureIR(Any(Before->Parent));
+        if (!After)
+          return;
+        After->Name = Before->Name;
+        printPassSummary(P, *Before, *After);
       });
 }
 
