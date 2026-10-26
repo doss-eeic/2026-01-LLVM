@@ -50,6 +50,10 @@
 #include "llvm/Transforms/Utils/Debugify.h"
 #include "llvm/Transforms/Utils/ProfileVerify.h"
 #include <chrono>
+#include <tuple>
+#include "llvm/ADT/Hashing.h"
+#include "llvm/IR/StructuralHash.h"
+#include "llvm/Support/MathExtras.h"
 #include <map>
 #include <memory>
 #include <optional>
@@ -414,6 +418,8 @@ struct IRStats {
   std::map<unsigned, unsigned> Ops; // opcode -> count
   // For loops: the parent function, which outlives a deleted loop.
   const Function *Parent = nullptr;
+  // Kind of IR unit: module, function, loop or scc.
+  const char *Kind = "";
   // Set right after the pre-pass measurement, so that the measurement itself
   // is not included in the pass time.
   std::chrono::steady_clock::time_point Start;
@@ -439,10 +445,12 @@ std::optional<IRStats> measureIR(Any IR) {
 
   if (const auto *M = llvm::any_cast<const Module *>(&IR)) {
     S.Name = "[module]";
+    S.Kind = "module";
     for (const Function &F : **M)
       CountFn(F);
   } else if (const auto *F = llvm::any_cast<const Function *>(&IR)) {
     S.Name = (*F)->getName().str();
+    S.Kind = "function";
     CountFn(**F);
   } else if (const auto *L = llvm::any_cast<const Loop *>(&IR)) {
     const BasicBlock *H = (*L)->getHeader();
@@ -452,10 +460,12 @@ std::optional<IRStats> measureIR(Any IR) {
     // A loop pass may also change the preheader, exit blocks or guard
     // blocks outside the loop, so measure the whole parent function.
     S.Parent = H->getParent();
+    S.Kind = "loop";
     CountFn(*S.Parent);
   } else if (const auto *C =
                  llvm::any_cast<const LazyCallGraph::SCC *>(&IR)) {
     S.Name = "(";
+    S.Kind = "scc";
     bool First = true;
     for (const LazyCallGraph::Node &N : **C) {
       if (!First)
@@ -573,6 +583,235 @@ static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
       });
 }
 
+static cl::opt<bool> PrintPassStats(
+    "print-pass-stats",
+    cl::desc("Aggregate per pass, IR unit kind and function size band how "
+             "often the IR changed and how long the pass took. Print a CSV "
+             "table to stderr when the pipeline finishes"),
+    cl::init(false));
+
+static cl::opt<bool> PassStatsTextHash(
+    "pass-stats-text-hash",
+    cl::desc("With -print-pass-stats, also decide whether the IR changed by a "
+             "detailed structural hash and by a hash of the printed IR text. "
+             "This is slow and meant for measuring how much the cheaper "
+             "opcode-count check misses"),
+    cl::init(false));
+
+namespace {
+struct PassStatsRow {
+  uint64_t Runs = 0;
+  uint64_t Changed = 0;               // opcode counts or BB count differ
+  uint64_t AllPreserved = 0;          // pass reported all analyses preserved
+  uint64_t UnchangedNotPreserved = 0; // looks unchanged, but pass says changed
+  uint64_t Invalidated = 0;           // IR unit was deleted by the pass
+  uint64_t TimeUs = 0;
+  uint64_t UnchangedTimeUs = 0;
+  // Only filled with -pass-stats-text-hash.
+  uint64_t HashedRuns = 0;
+  uint64_t ChangedDetail = 0;  // detailed structural hash differs
+  uint64_t ChangedText = 0;    // printed IR text differs
+  uint64_t TextOnly = 0;       // text differs, opcode check says unchanged
+  uint64_t DetailOnly = 0;     // detail hash differs, opcode check unchanged
+  uint64_t TextNotDetail = 0;  // text differs, detailed hash does not
+  uint64_t UnchangedTextTimeUs = 0;
+};
+using PassStatsKey = std::tuple<std::string, std::string, unsigned>;
+
+std::map<PassStatsKey, PassStatsRow> &passStatsTable() {
+  static std::map<PassStatsKey, PassStatsRow> T;
+  return T;
+}
+
+// Band 0 is an empty unit; band b >= 1 holds sizes in [2^(b-1), 2^b - 1].
+unsigned sizeBand(unsigned Insts) { return Insts ? Log2_32(Insts) + 1 : 0; }
+
+struct UnitHashes {
+  uint64_t Detail = 0;
+  uint64_t Text = 0;
+  bool Valid = false;
+};
+
+// Hash one IR unit. Loops use the parent function, like measureIR does.
+UnitHashes hashUnit(Any IR) {
+  UnitHashes H;
+  auto TextOf = [](auto &Obj) {
+    std::string Buf;
+    raw_string_ostream OS(Buf);
+    Obj.print(OS);
+    OS.flush();
+    return static_cast<uint64_t>(hash_value(StringRef(Buf)));
+  };
+  if (const auto *M = llvm::any_cast<const Module *>(&IR)) {
+    H.Detail = StructuralHash(**M, /*DetailedHash=*/true);
+    std::string Buf;
+    raw_string_ostream OS(Buf);
+    (*M)->print(OS, nullptr);
+    OS.flush();
+    H.Text = static_cast<uint64_t>(hash_value(StringRef(Buf)));
+    H.Valid = true;
+  } else if (const auto *F = llvm::any_cast<const Function *>(&IR)) {
+    H.Detail = StructuralHash(**F, /*DetailedHash=*/true);
+    H.Text = TextOf(**F);
+    H.Valid = true;
+  } else if (const auto *L = llvm::any_cast<const Loop *>(&IR)) {
+    const Function &PF = *(*L)->getHeader()->getParent();
+    H.Detail = StructuralHash(PF, /*DetailedHash=*/true);
+    H.Text = TextOf(PF);
+    H.Valid = true;
+  } else if (const auto *C = llvm::any_cast<const LazyCallGraph::SCC *>(&IR)) {
+    uint64_t D = 0, T = 0;
+    for (const LazyCallGraph::Node &N : **C) {
+      const Function &F = N.getFunction();
+      D = static_cast<uint64_t>(
+          hash_combine(D, (uint64_t)StructuralHash(F, /*DetailedHash=*/true)));
+      T = static_cast<uint64_t>(hash_combine(D == 0 ? 0 : T, TextOf(F)));
+    }
+    H.Detail = D;
+    H.Text = T;
+    H.Valid = true;
+  }
+  return H;
+}
+
+struct PassStatsFrame {
+  std::optional<IRStats> S;
+  UnitHashes H;
+};
+
+void recordPassStat(StringRef P, const IRStats &Before, bool Changed,
+                    bool Preserved, bool Invalidated, int64_t TimeUs,
+                    const UnitHashes *HB, const UnitHashes *HA) {
+  PassStatsRow &R = passStatsTable()[PassStatsKey(
+      P.str(), std::string(Before.Kind), sizeBand(Before.Insts))];
+  ++R.Runs;
+  R.TimeUs += TimeUs;
+  if (Changed)
+    ++R.Changed;
+  else
+    R.UnchangedTimeUs += TimeUs;
+  if (Preserved)
+    ++R.AllPreserved;
+  if (!Changed && !Preserved && !Invalidated)
+    ++R.UnchangedNotPreserved;
+  if (Invalidated)
+    ++R.Invalidated;
+  if (!PassStatsTextHash)
+    return;
+  if (Invalidated) {
+    // The unit is gone; count it as changed under every check.
+    ++R.HashedRuns;
+    ++R.ChangedDetail;
+    ++R.ChangedText;
+    return;
+  }
+  if (!HB || !HA || !HB->Valid || !HA->Valid)
+    return;
+  ++R.HashedRuns;
+  bool CD = HB->Detail != HA->Detail;
+  bool CT = HB->Text != HA->Text;
+  if (CD)
+    ++R.ChangedDetail;
+  if (CT)
+    ++R.ChangedText;
+  else
+    R.UnchangedTextTimeUs += TimeUs;
+  if (CT && !Changed)
+    ++R.TextOnly;
+  if (CD && !Changed)
+    ++R.DetailOnly;
+  if (CT && !CD)
+    ++R.TextNotDetail;
+}
+
+void printPassStatsTable() {
+  errs() << "pass-stats,pass,unit,band_min_insts,runs,changed,all_preserved,"
+            "unchanged_not_preserved,invalidated,time_us,unchanged_time_us,"
+            "hashed_runs,changed_detail,changed_text,text_only,detail_only,"
+            "text_not_detail,unchanged_text_time_us\n";
+  for (const auto &KV : passStatsTable()) {
+    const PassStatsRow &R = KV.second;
+    unsigned Band = std::get<2>(KV.first);
+    errs() << "pass-stats,\"" << std::get<0>(KV.first) << "\","
+           << std::get<1>(KV.first) << "," << (Band ? (1u << (Band - 1)) : 0u)
+           << "," << R.Runs << "," << R.Changed << "," << R.AllPreserved << ","
+           << R.UnchangedNotPreserved << "," << R.Invalidated << ","
+           << R.TimeUs << "," << R.UnchangedTimeUs << "," << R.HashedRuns
+           << "," << R.ChangedDetail << "," << R.ChangedText << ","
+           << R.TextOnly << "," << R.DetailOnly << "," << R.TextNotDetail << ","
+           << R.UnchangedTextTimeUs << "\n";
+  }
+}
+
+// Prints the table when runPassPipeline returns, whichever way it returns.
+struct PassStatsPrinter {
+  ~PassStatsPrinter() {
+    if (PrintPassStats)
+      printPassStatsTable();
+  }
+};
+} // namespace
+
+static void registerPassStats(PassInstrumentationCallbacks &PIC) {
+  auto Stack = std::make_shared<std::vector<PassStatsFrame>>();
+
+  PIC.registerBeforeNonSkippedPassCallback([Stack](StringRef P, Any IR) {
+    if (isContainerPass(P))
+      return;
+    PassStatsFrame Fr;
+    Fr.S = measureIR(IR);
+    if (Fr.S) {
+      if (PassStatsTextHash)
+        Fr.H = hashUnit(IR);
+      // Start the clock after all measuring is done.
+      Fr.S->Start = std::chrono::steady_clock::now();
+    }
+    Stack->push_back(std::move(Fr));
+  });
+
+  PIC.registerAfterPassCallback(
+      [Stack](StringRef P, Any IR, const PreservedAnalyses &PA) {
+        if (isContainerPass(P) || Stack->empty())
+          return;
+        auto End = std::chrono::steady_clock::now(); // before measuring
+        PassStatsFrame Fr = std::move(Stack->back());
+        Stack->pop_back();
+        if (!Fr.S)
+          return;
+        std::optional<IRStats> After = measureIR(IR);
+        if (!After)
+          return;
+        UnitHashes HA;
+        if (PassStatsTextHash)
+          HA = hashUnit(IR);
+        int64_t TimeUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                             End - Fr.S->Start)
+                             .count();
+        bool Changed =
+            !(Fr.S->Ops == After->Ops && Fr.S->BBs == After->BBs);
+        recordPassStat(P, *Fr.S, Changed, PA.areAllPreserved(),
+                       /*Invalidated=*/false, TimeUs, &Fr.H, &HA);
+      });
+
+  // The unit was invalidated (e.g. a deleted loop). It cannot be measured
+  // again, so count the run as changed and as invalidated.
+  PIC.registerAfterPassInvalidatedCallback(
+      [Stack](StringRef P, const PreservedAnalyses &) {
+        if (isContainerPass(P) || Stack->empty())
+          return;
+        auto End = std::chrono::steady_clock::now();
+        PassStatsFrame Fr = std::move(Stack->back());
+        Stack->pop_back();
+        if (!Fr.S)
+          return;
+        int64_t TimeUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                             End - Fr.S->Start)
+                             .count();
+        recordPassStat(P, *Fr.S, /*Changed=*/true, /*Preserved=*/false,
+                       /*Invalidated=*/true, TimeUs, nullptr, nullptr);
+      });
+}
+
 bool llvm::runPassPipeline(
     StringRef Arg0, Module &M, TargetMachine *TM, TargetLibraryInfoImpl *TLII,
     ToolOutputFile *Out, ToolOutputFile *ThinLTOLinkOut,
@@ -657,6 +896,9 @@ bool llvm::runPassPipeline(
   SI.registerCallbacks(PIC, &MAM);
   if (PrintPassSummary)
     registerPassSummary(PIC);
+  if (PrintPassStats)
+    registerPassStats(PIC);
+  PassStatsPrinter StatsPrinterGuard;
   DebugifyEachInstrumentation Debugify;
   DebugifyStatsMap DIStatsMap;
   DebugInfoPerPass DebugInfoBeforePass;
