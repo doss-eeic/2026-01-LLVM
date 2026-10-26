@@ -598,6 +598,13 @@ static cl::opt<bool> PassStatsTextHash(
              "opcode-count check misses"),
     cl::init(false));
 
+static cl::opt<bool> PassStatsReadable(
+    "pass-stats-table",
+    cl::desc("With -print-pass-stats, print a table per pass and IR unit kind, "
+             "sorted by the time spent in runs that did not change the IR, "
+             "instead of the CSV"),
+    cl::init(false));
+
 namespace {
 struct PassStatsRow {
   uint64_t Runs = 0;
@@ -743,11 +750,98 @@ void printPassStatsTable() {
   }
 }
 
+struct PassStatsAgg {
+  std::string Pass;
+  std::string Unit;
+  uint64_t Runs = 0;
+  uint64_t Changed = 0;
+  uint64_t TimeUs = 0;
+  uint64_t UnchangedTimeUs = 0;
+};
+
+// Prints Tenths / 10 with one decimal digit, e.g. 1234 -> "123.4".
+std::string fixed1(uint64_t Tenths) {
+  return std::to_string(Tenths / 10) + "." + std::to_string(Tenths % 10);
+}
+
+std::string padLeft(std::string S, size_t W) {
+  if (S.size() < W)
+    S.insert(0, W - S.size(), ' ');
+  return S;
+}
+
+std::string padRight(std::string S, size_t W) {
+  if (S.size() < W)
+    S.append(W - S.size(), ' ');
+  return S;
+}
+
+// Human readable summary: one row per (pass, IR unit kind), sorted by the time
+// spent in runs that did not change the IR.
+void printPassStatsReadable() {
+  std::map<std::pair<std::string, std::string>, PassStatsAgg> M;
+  for (const auto &KV : passStatsTable()) {
+    const PassStatsRow &R = KV.second;
+    PassStatsAgg &A = M[{std::get<0>(KV.first), std::get<1>(KV.first)}];
+    A.Pass = std::get<0>(KV.first);
+    A.Unit = std::get<1>(KV.first);
+    A.Runs += R.Runs;
+    A.Changed += R.Changed;
+    A.TimeUs += R.TimeUs;
+    A.UnchangedTimeUs += R.UnchangedTimeUs;
+  }
+  std::vector<PassStatsAgg> V;
+  PassStatsAgg Total;
+  for (const auto &KV : M) {
+    V.push_back(KV.second);
+    Total.Runs += KV.second.Runs;
+    Total.Changed += KV.second.Changed;
+    Total.TimeUs += KV.second.TimeUs;
+    Total.UnchangedTimeUs += KV.second.UnchangedTimeUs;
+  }
+  llvm::sort(V, [](const PassStatsAgg &A, const PassStatsAgg &B) {
+    if (A.UnchangedTimeUs != B.UnchangedTimeUs)
+      return A.UnchangedTimeUs > B.UnchangedTimeUs;
+    if (A.Pass != B.Pass)
+      return A.Pass < B.Pass;
+    return A.Unit < B.Unit;
+  });
+
+  auto PrintRow = [](const std::string &Name, const std::string &Unit,
+                     const PassStatsAgg &A) {
+    uint64_t Pct10 = A.TimeUs ? A.UnchangedTimeUs * 1000 / A.TimeUs : 0;
+    errs() << padRight(Name, 36) << padRight(Unit, 9)
+           << padLeft(std::to_string(A.Runs), 10)
+           << padLeft(std::to_string(A.Changed), 10)
+           << padLeft(std::to_string(A.Runs - A.Changed), 10)
+           << padLeft(fixed1(A.TimeUs / 100), 12)
+           << padLeft(fixed1(A.UnchangedTimeUs / 100), 12)
+           << padLeft(fixed1(Pct10), 7) << "\n";
+  };
+
+  errs() << padRight("pass", 36) << padRight("unit", 9) << padLeft("runs", 10)
+         << padLeft("changed", 10) << padLeft("unchanged", 10)
+         << padLeft("time_ms", 12) << padLeft("unch_ms", 12)
+         << padLeft("unch%", 7) << "\n";
+  for (const PassStatsAgg &A : V)
+    PrintRow(A.Pass, A.Unit, A);
+  PrintRow("TOTAL", "", Total);
+  errs() << "note: 'changed' means the opcode counts or the basic block count "
+            "of the IR unit differ. Changes that keep them (constants, flags, "
+            "attributes, code motion) count as unchanged.\n"
+            "note: unch_ms is the time of runs counted as unchanged. It is an "
+            "upper bound on time that could be saved, not an estimate of it.\n";
+}
+
 // Prints the table when runPassPipeline returns, whichever way it returns.
 struct PassStatsPrinter {
   ~PassStatsPrinter() {
-    if (PrintPassStats)
-      printPassStatsTable();
+    if (PrintPassStats) {
+      if (PassStatsReadable)
+        printPassStatsReadable();
+      else
+        printPassStatsTable();
+    }
   }
 };
 } // namespace
