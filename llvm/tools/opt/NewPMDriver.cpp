@@ -49,6 +49,7 @@
 #include "llvm/Transforms/Utils/AssignGUID.h"
 #include "llvm/Transforms/Utils/Debugify.h"
 #include "llvm/Transforms/Utils/ProfileVerify.h"
+#include <chrono>
 #include <map>
 #include <memory>
 #include <optional>
@@ -62,6 +63,19 @@ static cl::opt<bool> PrintPassSummary(
     cl::desc("Print a one-line summary (instruction/BB counts and per-opcode "
              "changes) for each pass that changed the IR"),
     cl::init(false));
+
+static cl::opt<bool> PrintPassSummaryTime(
+    "print-pass-summary-time",
+    cl::desc("With -print-pass-summary, also print the elapsed time of each "
+             "pass in microseconds"),
+    cl::init(false));
+
+static cl::opt<unsigned> PassSummaryMinTimeUs(
+    "print-pass-summary-min-time-us",
+    cl::desc("With -print-pass-summary-time, also print passes that did not "
+             "change the IR if they took at least this many microseconds "
+             "(0 = only print passes that changed the IR)"),
+    cl::init(0));
 using namespace opt_tool;
 
 cl::opt<bool> llvm::DebugifyEach(
@@ -400,6 +414,9 @@ struct IRStats {
   std::map<unsigned, unsigned> Ops; // opcode -> count
   // For loops: the parent function, which outlives a deleted loop.
   const Function *Parent = nullptr;
+  // Set right after the pre-pass measurement, so that the measurement itself
+  // is not included in the pass time.
+  std::chrono::steady_clock::time_point Start;
 };
 
 // Collect stats for a Module, Function, Loop or CGSCC. Other IR units are
@@ -485,15 +502,22 @@ std::string describeOpcodeDiff(const IRStats &B, const IRStats &A) {
 } // namespace
 
 static void printPassSummary(StringRef P, const IRStats &Before,
-                             const IRStats &After) {
+                             const IRStats &After, int64_t TimeUs) {
   std::string Diff = describeOpcodeDiff(Before, After);
-  if (Diff.empty() && Before.BBs == After.BBs)
-    return; // No change in instructions or basic blocks.
+  bool Changed = !(Diff.empty() && Before.BBs == After.BBs);
+  // Unchanged passes are normally skipped. With a minimum time they are still
+  // shown when they were slow.
+  bool Slow = PrintPassSummaryTime && PassSummaryMinTimeUs > 0 &&
+              TimeUs >= static_cast<int64_t>(PassSummaryMinTimeUs);
+  if (!Changed && !Slow)
+    return;
   errs() << "[pass-summary] " << P << " on " << After.Name << ": insts "
          << Before.Insts << " -> " << After.Insts << ", BBs " << Before.BBs
          << " -> " << After.BBs;
   if (!Diff.empty())
     errs() << " | " << Diff;
+  if (PrintPassSummaryTime)
+    errs() << " | time=" << TimeUs << "us";
   errs() << "\n";
 }
 
@@ -504,19 +528,26 @@ static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
   PIC.registerBeforeNonSkippedPassCallback([Stack](StringRef P, Any IR) {
     if (isContainerPass(P))
       return;
-    Stack->push_back(measureIR(IR));
+    std::optional<IRStats> S = measureIR(IR);
+    if (S)
+      S->Start = std::chrono::steady_clock::now();
+    Stack->push_back(std::move(S));
   });
 
   PIC.registerAfterPassCallback(
       [Stack](StringRef P, Any IR, const PreservedAnalyses &) {
         if (isContainerPass(P) || Stack->empty())
           return;
+        auto End = std::chrono::steady_clock::now(); // before measuring
         std::optional<IRStats> Before = std::move(Stack->back());
         Stack->pop_back();
         std::optional<IRStats> After = measureIR(IR);
         if (!Before || !After)
           return;
-        printPassSummary(P, *Before, *After);
+        int64_t TimeUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                             End - Before->Start)
+                             .count();
+        printPassSummary(P, *Before, *After, TimeUs);
       });
 
   // If the IR is invalidated (e.g. a deleted loop), the after-pass callback
@@ -526,6 +557,7 @@ static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
       [Stack](StringRef P, const PreservedAnalyses &) {
         if (isContainerPass(P) || Stack->empty())
           return;
+        auto End = std::chrono::steady_clock::now(); // before measuring
         std::optional<IRStats> Before = std::move(Stack->back());
         Stack->pop_back();
         if (!Before || !Before->Parent)
@@ -534,7 +566,10 @@ static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
         if (!After)
           return;
         After->Name = Before->Name;
-        printPassSummary(P, *Before, *After);
+        int64_t TimeUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                             End - Before->Start)
+                             .count();
+        printPassSummary(P, *Before, *After, TimeUs);
       });
 }
 
