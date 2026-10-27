@@ -49,7 +49,9 @@
 #include "llvm/Transforms/Utils/AssignGUID.h"
 #include "llvm/Transforms/Utils/Debugify.h"
 #include "llvm/Transforms/Utils/ProfileVerify.h"
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <tuple>
 #include "llvm/ADT/Hashing.h"
 #include "llvm/IR/StructuralHash.h"
@@ -79,6 +81,35 @@ static cl::opt<unsigned> PassSummaryMinTimeUs(
     cl::desc("With -print-pass-summary-time, also print passes that did not "
              "change the IR if they took at least this many microseconds "
              "(0 = only print passes that changed the IR)"),
+    cl::init(0));
+
+static cl::opt<bool> PassSummaryCompact(
+    "pass-summary-compact",
+    cl::desc("With -print-pass-summary, print shorter lines: a '[ps]' prefix, "
+             "pass names without the 'Pass' suffix, no 'on'/'insts' words, "
+             "BB counts only when they change, and an SCC as its first "
+             "function plus the number of the others"),
+    cl::init(false));
+
+static cl::opt<unsigned> PassSummaryNameWidth(
+    "pass-summary-name-width",
+    cl::desc("With -print-pass-summary, cut function and loop header names "
+             "longer than this many characters and end them with '...' "
+             "(0 = no limit)"),
+    cl::init(0));
+
+static cl::opt<unsigned> PassSummaryMaxOps(
+    "pass-summary-max-ops",
+    cl::desc("With -print-pass-summary, list at most this many opcodes, the "
+             "largest changes first, and count the rest as '+N more' "
+             "(0 = no limit)"),
+    cl::init(0));
+
+static cl::opt<unsigned> PrintPassSummaryTop(
+    "print-pass-summary-top",
+    cl::desc("With -print-pass-summary, keep all lines and print only the N "
+             "with the largest changes when the pipeline finishes, followed "
+             "by how many lines were left out (0 = print every line)"),
     cl::init(0));
 using namespace opt_tool;
 
@@ -420,6 +451,9 @@ struct IRStats {
   const Function *Parent = nullptr;
   // Kind of IR unit: module, function, loop or scc.
   const char *Kind = "";
+  // Parts of Name, for -pass-summary-compact and -pass-summary-name-width.
+  std::vector<std::string> Fns; // the function, or all functions of an SCC
+  std::string Header;           // loop header block name
   // Set right after the pre-pass measurement, so that the measurement itself
   // is not included in the pass time.
   std::chrono::steady_clock::time_point Start;
@@ -450,6 +484,7 @@ std::optional<IRStats> measureIR(Any IR) {
       CountFn(F);
   } else if (const auto *F = llvm::any_cast<const Function *>(&IR)) {
     S.Name = (*F)->getName().str();
+    S.Fns.push_back(S.Name);
     S.Kind = "function";
     CountFn(**F);
   } else if (const auto *L = llvm::any_cast<const Loop *>(&IR)) {
@@ -460,6 +495,8 @@ std::optional<IRStats> measureIR(Any IR) {
     // A loop pass may also change the preheader, exit blocks or guard
     // blocks outside the loop, so measure the whole parent function.
     S.Parent = H->getParent();
+    S.Header = H->hasName() ? H->getName().str() : std::string("<unnamed>");
+    S.Fns.push_back(H->getParent()->getName().str());
     S.Kind = "loop";
     CountFn(*S.Parent);
   } else if (const auto *C =
@@ -472,6 +509,7 @@ std::optional<IRStats> measureIR(Any IR) {
         S.Name += ", ";
       First = false;
       S.Name += N.getFunction().getName().str();
+      S.Fns.push_back(N.getFunction().getName().str());
       CountFn(N.getFunction());
     }
     S.Name += ")";
@@ -488,48 +526,170 @@ bool isContainerPass(StringRef P) {
          P.contains("InlinerWrapper");
 }
 
-// Describe per-opcode changes, e.g. "mul -1, shl +1". Empty if unchanged.
-std::string describeOpcodeDiff(const IRStats &B, const IRStats &A) {
+// Cut a name to -pass-summary-name-width characters, ending in "...".
+std::string cutName(StringRef S) {
+  unsigned W = PassSummaryNameWidth;
+  if (W == 0 || S.size() <= W)
+    return S.str();
+  if (W <= 3)
+    return S.take_front(W).str();
+  return (S.take_front(W - 3) + "...").str();
+}
+
+// The IR unit as printed in a summary line. Without -pass-summary-compact and
+// -pass-summary-name-width this equals IRStats::Name.
+std::string formatUnit(const IRStats &U) {
+  StringRef K(U.Kind);
+  if (U.Fns.empty())
+    return U.Name; // module, or an empty SCC
+  if (K == "loop") {
+    if (PassSummaryCompact)
+      return cutName(U.Fns[0]) + "/%" + cutName(U.Header);
+    return "loop %" + cutName(U.Header) + " in " + cutName(U.Fns[0]);
+  }
+  if (K == "scc") {
+    std::string S = "(" + cutName(U.Fns[0]);
+    if (PassSummaryCompact) {
+      if (U.Fns.size() > 1)
+        S += " +" + std::to_string(U.Fns.size() - 1);
+    } else {
+      for (size_t I = 1; I < U.Fns.size(); ++I)
+        S += ", " + cutName(U.Fns[I]);
+    }
+    return S + ")";
+  }
+  return cutName(U.Fns[0]); // function
+}
+
+struct OpcodeDiff {
+  std::string Text;       // e.g. "mul -1, shl +1"; empty if unchanged
+  uint64_t Magnitude = 0; // sum of |change| over all opcodes
+};
+
+// Describe per-opcode changes. With MaxOps > 0 and more opcodes than that,
+// list only the MaxOps largest changes, followed by "+N more".
+OpcodeDiff describeOpcodeDiff(const IRStats &B, const IRStats &A,
+                              unsigned MaxOps) {
   std::map<unsigned, int> Delta;
   for (const auto &KV : B.Ops)
     Delta[KV.first] -= static_cast<int>(KV.second);
   for (const auto &KV : A.Ops)
     Delta[KV.first] += static_cast<int>(KV.second);
-  std::string Out;
-  raw_string_ostream OS(Out);
-  bool First = true;
-  for (const auto &KV : Delta) {
-    if (KV.second == 0)
-      continue;
-    if (!First)
-      OS << ", ";
-    First = false;
-    OS << Instruction::getOpcodeName(KV.first) << " "
-       << (KV.second > 0 ? "+" : "") << KV.second;
+  std::vector<std::pair<unsigned, int>> V;
+  for (const auto &KV : Delta)
+    if (KV.second != 0)
+      V.push_back(KV);
+  OpcodeDiff D;
+  for (const auto &E : V)
+    D.Magnitude += static_cast<uint64_t>(std::abs(E.second));
+  size_t Shown = V.size();
+  if (MaxOps > 0 && V.size() > MaxOps) {
+    // Largest changes first; ties keep the opcode order.
+    std::stable_sort(V.begin(), V.end(), [](const auto &X, const auto &Y) {
+      return std::abs(X.second) > std::abs(Y.second);
+    });
+    Shown = MaxOps;
   }
-  return OS.str();
+  std::string Text;
+  {
+    raw_string_ostream OS(Text);
+    for (size_t I = 0; I < Shown; ++I) {
+      if (I)
+        OS << ", ";
+      OS << Instruction::getOpcodeName(V[I].first) << " "
+         << (V[I].second > 0 ? "+" : "") << V[I].second;
+    }
+    if (Shown < V.size())
+      OS << ", +" << (V.size() - Shown) << " more";
+  }
+  D.Text = std::move(Text);
+  return D;
 }
+
+// Lines kept for -print-pass-summary-top, in the order the passes ran.
+struct SummaryLine {
+  uint64_t Score; // size of the change, for sorting
+  std::string Text;
+};
+
+std::vector<SummaryLine> &summaryLines() {
+  static std::vector<SummaryLine> V;
+  return V;
+}
+
+uint64_t absDiff(unsigned X, unsigned Y) { return X > Y ? X - Y : Y - X; }
 } // namespace
 
+// Unit is the IR unit to name: After, except for an invalidated loop, where
+// After measures the parent function.
 static void printPassSummary(StringRef P, const IRStats &Before,
-                             const IRStats &After, int64_t TimeUs) {
-  std::string Diff = describeOpcodeDiff(Before, After);
-  bool Changed = !(Diff.empty() && Before.BBs == After.BBs);
+                             const IRStats &After, const IRStats &Unit,
+                             int64_t TimeUs) {
+  OpcodeDiff D = describeOpcodeDiff(Before, After, PassSummaryMaxOps);
+  bool Changed = !(D.Text.empty() && Before.BBs == After.BBs);
   // Unchanged passes are normally skipped. With a minimum time they are still
   // shown when they were slow.
   bool Slow = PrintPassSummaryTime && PassSummaryMinTimeUs > 0 &&
               TimeUs >= static_cast<int64_t>(PassSummaryMinTimeUs);
   if (!Changed && !Slow)
     return;
-  errs() << "[pass-summary] " << P << " on " << After.Name << ": insts "
-         << Before.Insts << " -> " << After.Insts << ", BBs " << Before.BBs
-         << " -> " << After.BBs;
-  if (!Diff.empty())
-    errs() << " | " << Diff;
-  if (PrintPassSummaryTime)
-    errs() << " | time=" << TimeUs << "us";
-  errs() << "\n";
+  std::string Line;
+  {
+    raw_string_ostream OS(Line);
+    if (PassSummaryCompact) {
+      StringRef Name = P;
+      Name.consume_back("Pass");
+      OS << "[ps] " << Name << " " << formatUnit(Unit) << ": "
+         << Before.Insts << "->" << After.Insts;
+      if (Before.BBs != After.BBs)
+        OS << " bb " << Before.BBs << "->" << After.BBs;
+    } else {
+      OS << "[pass-summary] " << P << " on " << formatUnit(Unit)
+         << ": insts " << Before.Insts << " -> " << After.Insts << ", BBs "
+         << Before.BBs << " -> " << After.BBs;
+    }
+    if (!D.Text.empty())
+      OS << " | " << D.Text;
+    if (PrintPassSummaryTime)
+      OS << (PassSummaryCompact ? " | " : " | time=") << TimeUs << "us";
+  }
+  if (PrintPassSummaryTop == 0) {
+    errs() << Line << "\n";
+    return;
+  }
+  // Rank by the opcode changes. Lines without them (slow but unchanged runs)
+  // fall back to the instruction and BB count changes.
+  uint64_t Score = D.Magnitude ? D.Magnitude
+                               : absDiff(Before.Insts, After.Insts) +
+                                     absDiff(Before.BBs, After.BBs);
+  summaryLines().push_back({Score, std::move(Line)});
 }
+
+// Print the kept lines, largest changes first, and how many were left out.
+static void printPassSummaryTop() {
+  std::vector<SummaryLine> &V = summaryLines();
+  std::stable_sort(V.begin(), V.end(),
+                   [](const SummaryLine &A, const SummaryLine &B) {
+                     return A.Score > B.Score;
+                   });
+  size_t N = std::min<size_t>(PrintPassSummaryTop, V.size());
+  for (size_t I = 0; I < N; ++I)
+    errs() << V[I].Text << "\n";
+  errs() << (PassSummaryCompact ? "[ps] " : "[pass-summary] ") << "top " << N
+         << " of " << V.size() << " lines shown, " << (V.size() - N)
+         << " omitted (largest changes first)\n";
+  V.clear();
+}
+
+namespace {
+// Prints the -print-pass-summary-top lines when runPassPipeline returns.
+struct PassSummaryPrinter {
+  ~PassSummaryPrinter() {
+    if (PrintPassSummary && PrintPassSummaryTop > 0)
+      printPassSummaryTop();
+  }
+};
+} // namespace
 
 static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
   // Passes are nested, so keep the pre-pass stats on a stack.
@@ -557,7 +717,7 @@ static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
         int64_t TimeUs = std::chrono::duration_cast<std::chrono::microseconds>(
                              End - Before->Start)
                              .count();
-        printPassSummary(P, *Before, *After, TimeUs);
+        printPassSummary(P, *Before, *After, *After, TimeUs);
       });
 
   // If the IR is invalidated (e.g. a deleted loop), the after-pass callback
@@ -579,7 +739,7 @@ static void registerPassSummary(PassInstrumentationCallbacks &PIC) {
         int64_t TimeUs = std::chrono::duration_cast<std::chrono::microseconds>(
                              End - Before->Start)
                              .count();
-        printPassSummary(P, *Before, *After, TimeUs);
+        printPassSummary(P, *Before, *After, *Before, TimeUs);
       });
 }
 
@@ -993,6 +1153,7 @@ bool llvm::runPassPipeline(
   if (PrintPassStats)
     registerPassStats(PIC);
   PassStatsPrinter StatsPrinterGuard;
+  PassSummaryPrinter SummaryPrinterGuard;
   DebugifyEachInstrumentation Debugify;
   DebugifyStatsMap DIStatsMap;
   DebugInfoPerPass DebugInfoBeforePass;
