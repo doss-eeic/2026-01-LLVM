@@ -924,6 +924,10 @@ struct PassStatsAgg {
   uint64_t Changed = 0;
   uint64_t TimeUs = 0;
   uint64_t UnchangedTimeUs = 0;
+  // Only filled with -pass-stats-text-hash.
+  uint64_t ChangedDetail = 0;
+  uint64_t ChangedText = 0;
+  uint64_t TextOnly = 0;
 };
 
 // Prints Tenths / 10 with one decimal digit, e.g. 1234 -> "123.4".
@@ -956,6 +960,9 @@ void printPassStatsReadable() {
     A.Changed += R.Changed;
     A.TimeUs += R.TimeUs;
     A.UnchangedTimeUs += R.UnchangedTimeUs;
+    A.ChangedDetail += R.ChangedDetail;
+    A.ChangedText += R.ChangedText;
+    A.TextOnly += R.TextOnly;
   }
   std::vector<PassStatsAgg> V;
   PassStatsAgg Total;
@@ -965,6 +972,9 @@ void printPassStatsReadable() {
     Total.Changed += KV.second.Changed;
     Total.TimeUs += KV.second.TimeUs;
     Total.UnchangedTimeUs += KV.second.UnchangedTimeUs;
+    Total.ChangedDetail += KV.second.ChangedDetail;
+    Total.ChangedText += KV.second.ChangedText;
+    Total.TextOnly += KV.second.TextOnly;
   }
   llvm::sort(V, [](const PassStatsAgg &A, const PassStatsAgg &B) {
     if (A.UnchangedTimeUs != B.UnchangedTimeUs)
@@ -983,13 +993,26 @@ void printPassStatsReadable() {
            << padLeft(std::to_string(A.Runs - A.Changed), 10)
            << padLeft(fixed1(A.TimeUs / 100), 12)
            << padLeft(fixed1(A.UnchangedTimeUs / 100), 12)
-           << padLeft(fixed1(Pct10), 7) << "\n";
+           << padLeft(fixed1(Pct10), 7);
+    if (PassStatsTextHash) {
+      uint64_t Miss10 =
+          A.ChangedText ? A.TextOnly * 1000 / A.ChangedText : 0;
+      errs() << padLeft(std::to_string(A.ChangedDetail), 12)
+             << padLeft(std::to_string(A.ChangedText), 10)
+             << padLeft(std::to_string(A.TextOnly), 8)
+             << padLeft(fixed1(Miss10), 7);
+    }
+    errs() << "\n";
   };
 
   errs() << padRight("pass", 36) << padRight("unit", 9) << padLeft("runs", 10)
          << padLeft("changed", 10) << padLeft("unchanged", 10)
          << padLeft("time_ms", 12) << padLeft("unch_ms", 12)
-         << padLeft("unch%", 7) << "\n";
+         << padLeft("unch%", 7);
+  if (PassStatsTextHash)
+    errs() << padLeft("chg_detail", 12) << padLeft("chg_text", 10)
+           << padLeft("missed", 8) << padLeft("miss%", 7);
+  errs() << "\n";
   for (const PassStatsAgg &A : V)
     PrintRow(A.Pass, A.Unit, A);
   PrintRow("TOTAL", "", Total);
@@ -998,6 +1021,11 @@ void printPassStatsReadable() {
             "attributes, code motion) count as unchanged.\n"
             "note: unch_ms is the time of runs counted as unchanged. It is an "
             "upper bound on time that could be saved, not an estimate of it.\n";
+  if (PassStatsTextHash)
+    errs() << "note: chg_detail and chg_text count runs whose detailed "
+              "structural hash or printed IR text changed. missed counts runs "
+              "whose text changed while the opcode check said unchanged; "
+              "miss% = missed / chg_text.\n";
 }
 
 // Prints the table when runPassPipeline returns, whichever way it returns.
