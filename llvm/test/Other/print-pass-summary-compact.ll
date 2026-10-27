@@ -6,7 +6,7 @@
 ; COMPACT: [ps] InstCombine f: 2->2 | mul -1, shl +1{{$}}
 ; COMPACT: [ps] InstCombine g: 4->1 | add -3{{$}}
 
-; WIDTH: [pass-summary] InstCombinePass on a_very_...: insts 2 -> 2, BBs 1 -> 1 | mul -1, shl +1{{$}}
+; WIDTH: [pass-summary] InstCombinePass on a_..._name: insts 2 -> 2, BBs 1 -> 1 | mul -1, shl +1{{$}}
 
 ; OPS: [pass-summary] InstCombinePass on f: insts 2 -> 2, BBs 1 -> 1 | mul -1, +1 more{{$}}
 

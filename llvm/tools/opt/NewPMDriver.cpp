@@ -94,7 +94,8 @@ static cl::opt<bool> PassSummaryCompact(
 static cl::opt<unsigned> PassSummaryNameWidth(
     "pass-summary-name-width",
     cl::desc("With -print-pass-summary, cut function and loop header names "
-             "longer than this many characters and end them with '...' "
+             "longer than this many characters by replacing their middle "
+             "with '...' "
              "(0 = no limit)"),
     cl::init(0));
 
@@ -526,14 +527,20 @@ bool isContainerPass(StringRef P) {
          P.contains("InlinerWrapper");
 }
 
-// Cut a name to -pass-summary-name-width characters, ending in "...".
+// Cut a name to -pass-summary-name-width characters by replacing its middle
+// with "...". The tail gets two thirds of the room: in a mangled name the
+// head is a namespace or class prefix that many functions share, and the part
+// that tells them apart (the method name) is near the end.
 std::string cutName(StringRef S) {
   unsigned W = PassSummaryNameWidth;
   if (W == 0 || S.size() <= W)
     return S.str();
-  if (W <= 3)
+  if (W <= 5)
     return S.take_front(W).str();
-  return (S.take_front(W - 3) + "...").str();
+  size_t Room = W - 3;
+  size_t Head = Room / 3;
+  size_t Tail = Room - Head;
+  return (S.take_front(Head) + "..." + S.take_back(Tail)).str();
 }
 
 // The IR unit as printed in a summary line. Without -pass-summary-compact and
