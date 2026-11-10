@@ -24,6 +24,7 @@
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
+#include <cstdint>
 #include <utility>
 
 namespace llvm {
@@ -51,6 +52,30 @@ class Value;
 /// JumpThreading.
 /// These are implementation details and should not be used by clients.
 namespace jumpthreading {
+
+/// Features available immediately before a JumpThreading invocation starts.
+/// This structure is intentionally independent from the predictor so a future
+/// learned model can replace the rule without changing feature extraction.
+struct JTFunctionFeatures {
+  uint64_t InstructionCount = 0;
+  uint64_t BasicBlockCount = 0;
+  uint64_t BranchCount = 0;
+  uint64_t ConditionalBranchCount = 0;
+  uint64_t PHICount = 0;
+  uint64_t LoadCount = 0;
+  uint64_t StoreCount = 0;
+  uint64_t PredCountSum = 0;
+  uint64_t PredCountMin = 0;
+  uint64_t PredCountMax = 0;
+  uint64_t SuccCountSum = 0;
+  uint64_t SuccCountMin = 0;
+  uint64_t SuccCountMax = 0;
+  uint64_t CFGMergeCount = 0;
+};
+
+/// Provisional feature-based predictor. The thresholds are deliberately kept
+/// in one function so that a learned predictor can replace this interface.
+LLVM_ABI unsigned predictJumpThreadingBudget(const JTFunctionFeatures &Features);
 
 // These are at global scope so static functions can use them too.
 using PredValueInfo = SmallVectorImpl<std::pair<Constant *, BasicBlock *>>;
@@ -102,6 +127,15 @@ class JumpThreadingPass : public OptionalPassInfoMixin<JumpThreadingPass> {
 
   unsigned BBDupThreshold;
   unsigned DefaultBBDupThreshold;
+  unsigned ImplicationSearchThresholdForFunction = 3;
+  unsigned FunctionInstructionCount = 0;
+  jumpthreading::JTFunctionFeatures FunctionFeatures;
+  uint64_t InvocationID = 0;
+  uint64_t FeatureExtractionTimeNs = 0;
+  unsigned ImplicationSearchCutoffCount = 0;
+  unsigned ImplicationSearchConsumedCount = 0;
+  unsigned ImplicationSearchAttemptCount = 0;
+  unsigned ImplicationSearchSuccessCount = 0;
 
 public:
   LLVM_ABI JumpThreadingPass(int T = -1);

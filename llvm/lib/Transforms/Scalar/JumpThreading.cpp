@@ -71,9 +71,13 @@
 #include "llvm/Transforms/Utils/SSAUpdater.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 #include <cassert>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <iterator>
 #include <memory>
+#include <string>
 #include <utility>
 
 using namespace llvm;
@@ -85,6 +89,62 @@ STATISTIC(NumThreads, "Number of jumps threaded");
 STATISTIC(NumFolds,   "Number of terminators folded");
 STATISTIC(NumDupes,   "Number of branch blocks duplicated to eliminate phi");
 
+static cl::opt<unsigned>
+BBDuplicateThreshold("jump-threading-threshold",
+          cl::desc("Max block size to duplicate for jump threading"),
+          cl::init(6), cl::Hidden);
+
+static cl::opt<unsigned>
+ImplicationSearchThreshold(
+  "jump-threading-implication-search-threshold",
+  cl::desc("The number of predecessors to search for a stronger "
+           "condition to use to thread over a weaker condition"),
+  cl::init(3), cl::Hidden);
+
+static cl::opt<std::string> JTFunctionBudgetMode(
+    "jump-threading-budget-mode", cl::init("default"), cl::Hidden,
+    cl::desc("JumpThreading function budget mode: default, fixed, dynamic, or rule"));
+static cl::opt<unsigned> JTFunctionBudgetFixed(
+    "jump-threading-budget-fixed", cl::init(3), cl::Hidden,
+    cl::desc("Fixed JumpThreading implication-search budget"));
+static cl::opt<unsigned> JTFunctionBudgetSmallThreshold(
+    "jump-threading-budget-small-threshold", cl::init(100), cl::Hidden);
+static cl::opt<unsigned> JTFunctionBudgetLargeThreshold(
+    "jump-threading-budget-large-threshold", cl::init(1000), cl::Hidden);
+static cl::opt<bool> JTFunctionBudgetLog(
+    "jump-threading-budget-log", cl::init(false), cl::Hidden,
+    cl::desc("Log JumpThreading function budget decisions"));
+static cl::opt<bool> JTFunctionBudgetFeatureExtraction(
+    "jump-threading-budget-feature-extraction", cl::init(true), cl::Hidden,
+    cl::desc("Collect full JumpThreading function features before budgeting"));
+
+static std::atomic<uint64_t> JTInvocationCounter{0};
+
+unsigned jumpthreading::predictJumpThreadingBudget(
+    const JTFunctionFeatures &Features) {
+  // Provisional rule only: it is a testable interface, not a tuned optimum.
+  if (Features.InstructionCount < 100 &&
+      Features.BasicBlockCount < 20 &&
+      Features.ConditionalBranchCount < 8)
+    return 1;
+  if (Features.InstructionCount >= 1000 ||
+      Features.BasicBlockCount >= 200 ||
+      Features.ConditionalBranchCount >= 100 || Features.PHICount >= 50)
+    return 6;
+  return 3;
+}
+
+static cl::opt<unsigned> PhiDuplicateThreshold(
+    "jump-threading-phi-threshold",
+    cl::desc("Max PHIs in BB to duplicate for jump threading"), cl::init(76),
+    cl::Hidden);
+
+static cl::opt<bool> ThreadAcrossLoopHeaders(
+    "jump-threading-across-loop-headers",
+    cl::desc("Allow JumpThreading to thread across loop headers, for testing"),
+    cl::init(false), cl::Hidden);
+
+=======
 namespace llvm {
 extern cl::opt<bool> ProfcheckDisableMetadataFixes;
 }
@@ -270,6 +330,99 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
   LLVM_DEBUG(dbgs() << "Jump threading on function '" << F_.getName() << "'\n");
   Opts = &ScalarOptions::Global;
   F = &F_;
+  InvocationID = JTInvocationCounter.fetch_add(1, std::memory_order_relaxed) + 1;
+  auto FeatureStart = std::chrono::steady_clock::now();
+  FunctionFeatures = {};
+  // InstructionCount is retained for the legacy size-based dynamic mode. The
+  // other fields are optional and can be skipped for default/fixed controls.
+  for (const BasicBlock &BB : *F) {
+    FunctionFeatures.InstructionCount += BB.size();
+    if (!JTFunctionBudgetFeatureExtraction)
+      continue;
+    FunctionFeatures.BasicBlockCount = F->size();
+    FunctionFeatures.PredCountSum += pred_size(&BB);
+    FunctionFeatures.SuccCountSum += succ_size(&BB);
+    FunctionFeatures.PredCountMin =
+        FunctionFeatures.PredCountMin == 0
+            ? pred_size(&BB)
+            : std::min<uint64_t>(FunctionFeatures.PredCountMin, pred_size(&BB));
+    FunctionFeatures.PredCountMax =
+        std::max<uint64_t>(FunctionFeatures.PredCountMax, pred_size(&BB));
+    FunctionFeatures.SuccCountMin =
+        FunctionFeatures.SuccCountMin == 0
+            ? succ_size(&BB)
+            : std::min<uint64_t>(FunctionFeatures.SuccCountMin, succ_size(&BB));
+    FunctionFeatures.SuccCountMax =
+        std::max<uint64_t>(FunctionFeatures.SuccCountMax, succ_size(&BB));
+    if (pred_size(&BB) > 1)
+      ++FunctionFeatures.CFGMergeCount;
+    for (const Instruction &I : BB) {
+      if (isa<UncondBrInst>(I))
+        ++FunctionFeatures.BranchCount;
+      else if (isa<CondBrInst>(I)) {
+        ++FunctionFeatures.BranchCount;
+        ++FunctionFeatures.ConditionalBranchCount;
+      }
+      if (isa<PHINode>(I))
+        ++FunctionFeatures.PHICount;
+      if (isa<LoadInst>(I))
+        ++FunctionFeatures.LoadCount;
+      if (isa<StoreInst>(I))
+        ++FunctionFeatures.StoreCount;
+    }
+  }
+  FunctionInstructionCount = FunctionFeatures.InstructionCount;
+  FeatureExtractionTimeNs = JTFunctionBudgetFeatureExtraction
+                                ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - FeatureStart)
+                                      .count()
+                                : 0;
+  ImplicationSearchCutoffCount = 0;
+  ImplicationSearchConsumedCount = 0;
+  ImplicationSearchAttemptCount = 0;
+  ImplicationSearchSuccessCount = 0;
+  ImplicationSearchThresholdForFunction = ImplicationSearchThreshold;
+  if (JTFunctionBudgetMode == "fixed")
+    ImplicationSearchThresholdForFunction = JTFunctionBudgetFixed;
+  else if (JTFunctionBudgetMode == "dynamic")
+    ImplicationSearchThresholdForFunction =
+        FunctionInstructionCount < JTFunctionBudgetSmallThreshold
+            ? 1
+            : (FunctionInstructionCount < JTFunctionBudgetLargeThreshold ? 3
+                                                                          : 6);
+  else if (JTFunctionBudgetMode == "rule") {
+    if (!JTFunctionBudgetFeatureExtraction)
+      report_fatal_error("rule budget mode requires feature extraction");
+    ImplicationSearchThresholdForFunction =
+        predictJumpThreadingBudget(FunctionFeatures);
+  }
+  else if (JTFunctionBudgetMode != "default")
+    report_fatal_error("unknown jump-threading budget mode");
+  if (JTFunctionBudgetLog)
+    errs() << "jt-budget-selected module="
+           << F->getParent()->getModuleIdentifier()
+           << " function=" << F->getName()
+           << " invocation_id=" << InvocationID
+           << " instructions=" << FunctionInstructionCount
+           << " basic_blocks=" << FunctionFeatures.BasicBlockCount
+           << " branches=" << FunctionFeatures.BranchCount
+           << " conditional_branches="
+           << FunctionFeatures.ConditionalBranchCount
+           << " phis=" << FunctionFeatures.PHICount
+           << " loads=" << FunctionFeatures.LoadCount
+           << " stores=" << FunctionFeatures.StoreCount
+           << " pred_sum=" << FunctionFeatures.PredCountSum
+           << " pred_min=" << FunctionFeatures.PredCountMin
+           << " pred_max=" << FunctionFeatures.PredCountMax
+           << " succ_sum=" << FunctionFeatures.SuccCountSum
+           << " succ_min=" << FunctionFeatures.SuccCountMin
+           << " succ_max=" << FunctionFeatures.SuccCountMax
+           << " cfg_merges=" << FunctionFeatures.CFGMergeCount
+           << " feature_extraction="
+           << (JTFunctionBudgetFeatureExtraction ? "on" : "off")
+           << " feature_ns=" << FeatureExtractionTimeNs
+           << " mode=" << JTFunctionBudgetMode
+           << " budget=" << ImplicationSearchThresholdForFunction << "\n";
   FAM = FAM_;
   TLI = TLI_;
   TTI = TTI_;
@@ -361,6 +514,18 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
     }
 
   LoopHeaders.clear();
+  if (JTFunctionBudgetLog)
+    errs() << "jt-budget-result module="
+           << F->getParent()->getModuleIdentifier()
+           << " function=" << F->getName()
+           << " invocation_id=" << InvocationID
+           << " instructions=" << FunctionInstructionCount
+           << " mode=" << JTFunctionBudgetMode
+           << " budget=" << ImplicationSearchThresholdForFunction
+           << " consumed=" << ImplicationSearchConsumedCount
+           << " exhausted=" << ImplicationSearchCutoffCount
+           << " attempted=" << ImplicationSearchAttemptCount
+           << " succeeded=" << ImplicationSearchSuccessCount << "\n";
   return EverChanged;
 }
 
@@ -1123,6 +1288,7 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
 }
 
 bool JumpThreadingPass::processImpliedCondition(BasicBlock *BB) {
+  ++ImplicationSearchAttemptCount;
   auto *BI = dyn_cast<CondBrInst>(BB->getTerminator());
   if (!BI)
     return false;
@@ -1145,9 +1311,8 @@ bool JumpThreadingPass::processImpliedCondition(BasicBlock *BB) {
 
   auto &DL = BB->getDataLayout();
 
-  while (CurrentPred &&
-         Iter++ < Opts->jump_threading_implication_search_threshold) {
-    auto *PBI = dyn_cast<CondBrInst>(CurrentPred->getTerminator());
+  while (CurrentPred && Iter++ < ImplicationSearchThresholdForFunction) {
+    ++ImplicationSearchConsumedCount;    auto *PBI = dyn_cast<CondBrInst>(CurrentPred->getTerminator());
     if (!PBI)
       return false;
     if (PBI->getSuccessor(0) != CurrentBB && PBI->getSuccessor(1) != CurrentBB)
@@ -1173,6 +1338,7 @@ bool JumpThreadingPass::processImpliedCondition(BasicBlock *BB) {
           UncondBrInst::Create(KeepSucc, BI->getIterator());
       UncondBI->setDebugLoc(BI->getDebugLoc());
       ++NumFolds;
+      ++ImplicationSearchSuccessCount;
       BI->eraseFromParent();
       if (FICond)
         FICond->eraseFromParent();
@@ -1185,6 +1351,9 @@ bool JumpThreadingPass::processImpliedCondition(BasicBlock *BB) {
     CurrentBB = CurrentPred;
     CurrentPred = CurrentBB->getSinglePredecessor();
   }
+
+  if (CurrentPred && Iter >= ImplicationSearchThresholdForFunction)
+    ++ImplicationSearchCutoffCount;
 
   return false;
 }
